@@ -1,5 +1,18 @@
 local modname = minetest.get_current_modname()
 
+-- latest crazy way to detect MCL vs VL per rudzik8
+local function mcl_is_mineclonia()
+	local path = core.get_modpath("_mcl_autogroup")
+	if path == nil then return false end
+	local f = assert(io.open(path .. DIR_DELIM .. "init.lua", "r"))
+	local code = f:read("*a")
+	if code:find("_mcl_burntime") then
+		return true
+	end
+	return false
+end
+local has_default = core.get_modpath("default") ~= nil
+
 local open_forms = {} -- [playername] = { pos=..., detached_name=..., formname=... }
 
 local function p2s(pos)
@@ -18,6 +31,19 @@ local function same_pos(a, b)
 	return a and b and a.x == b.x and a.y == b.y and a.z == b.z
 end
 
+-- VoxeLibre drop all inventory
+local function after_dig_node(pos, oldnode, oldmetadata, digger)
+	if mcl_util and mcl_util.drop_items_from_meta_container then
+		for _, listname in ipairs({"stock","currency","vault"}) do
+			mcl_util.drop_items_from_meta_container(listname)(pos, oldnode, oldmetadata)
+		end
+	end
+end
+-- Mineclonia drop all inventory
+if mcl_util and mcl_util.drop_items_from_meta_container and mcl_is_mineclonia() then
+	after_dig_node = mcl_util.drop_items_from_meta_container({"stock","currency","vault"})
+end
+
 local function get_base_pos_from_any_part(pos)
 	local node = minetest.get_node(pos)
 	if node.name == modname .. ":vending_machine_off" or node.name == modname .. ":vending_machine_on" then
@@ -30,6 +56,48 @@ local function get_base_pos_from_any_part(pos)
 		end
 	end
 	return nil
+end
+
+local function notify_observers(pos)
+	-- Mineclonia
+	if mcl_redstone and mcl_redstone._notify_observer_neighbours then
+		mcl_redstone._notify_observer_neighbours(pos)
+		mcl_redstone._notify_observer_neighbours(vector.new(pos_above(pos)))
+	end
+	-- Voxelibre does not have this function, so we have to do it ourselves.
+	-- FIXME: this makes the observer trigger, even if it is not facing
+	-- the vending machine.
+	if mcl_observers and mcl_observers.observer_activate then
+		for _, v in ipairs({
+			{1,0,0},{-1,0,0},
+			{1,1,0},{-1,1,0},
+			{0,0,1},{0,0,-1},
+			{0,1,1},{0,1,-1},
+			{0,-1,0},{0,2,0},
+		}) do
+			local nv = vector.new(v[1],v[2],v[3])
+			local opos = vector.add(pos,nv)
+			mcl_observers.observer_activate(opos)
+		end
+	end
+end
+
+local function power_action(pos, node)
+	local n = minetest.get_node(pos)
+	local powerstring = mcl_redstone.get_power(pos) ~= 0 and "on" or "off"
+	local destname = modname .. ":vending_machine_" .. powerstring
+	if n.name ~= destname then
+		n.name = destname
+		-- mcl_redstone.swap_node does not notify observers, so we will still do that
+		mcl_redstone.swap_node(pos, n)
+		local top = vector.new(pos_above(pos))
+		local t = minetest.get_node(top)
+		if t.name ~= modname .. ":vending_machine_top_" .. powerstring then
+			t.name = modname .. ":vending_machine_top_" .. powerstring
+			mcl_redstone.swap_node(top, t)
+		end
+		notify_observers(pos)
+	end
 end
 
 local function get_detached_name(playername, pos)
@@ -414,6 +482,8 @@ minetest.register_node(modname .. ":vending_machine_off", {
 	_mcl_hoppers_on_try_pull = hopper_pull_from_vault,
 	is_ground_content = false,
 	groups = {pickaxey = 1, handy = 1, container = 2},
+	protected = true,
+	after_dig_node = after_dig_node,
 
 	mesecons = {
 		effector = {
@@ -430,6 +500,14 @@ minetest.register_node(modname .. ":vending_machine_off", {
 				end
 			end,
 		}
+	},
+	_mcl_redstone = {
+		connects_to = function(node, dir)
+			return false
+		end,
+		update = function(pos, node)
+			return power_action(pos, node)
+		end,
 	},
 
 	on_construct = function(pos)
@@ -626,6 +704,8 @@ minetest.register_node(modname .. ":vending_machine_on", {
 	light_source = 4,
 	drop = modname .. ":vending_machine_off",
 	groups = {pickaxey = 1, handy = 1, container = 2, not_in_creative_inventory = 1},
+	protected = true,
+	after_dig_node = after_dig_node,
 
 	mesecons = {
 		effector = {
@@ -642,6 +722,14 @@ minetest.register_node(modname .. ":vending_machine_on", {
 				end
 			end,
 		}
+	},
+	_mcl_redstone = {
+		connects_to = function(node, dir)
+			return false
+		end,
+		update = function(pos, node)
+			return power_action(pos, node)
+		end,
 	},
 
 	on_rightclick = function(pos, node, clicker)
@@ -842,6 +930,11 @@ minetest.register_node(modname .. ":vending_machine_on", {
 		local inv = meta:get_inventory()
 		local to_add = ItemStack(currency_name .. " " .. total_cost)
 		local leftover = inv:add_item("vault", to_add)
+		core.log("action", "[" .. modname .. "] " .. playername ..
+			" bought " .. stack:to_string() .. " with " .. to_add:to_string() ..
+			" at " .. core.pos_to_string(pos) .. " owned by " .. owner
+		)
+		notify_observers(pos)
 
 		if not leftover:is_empty() then
 			local p = payinv:get_stack("pay", 1)
@@ -958,12 +1051,26 @@ minetest.register_lbm({
 	end,
 })
 
+local glass = "xpanes:pane_natural_flat"
+local iron_door = "mcl_doors:iron_door"
+local iron_trapdoor = "mcl_doors:iron_trapdoor"
+local comparator = "mcl_comparators:comparator_off_comp"
+local chest = "group:chest"
+if mcl_is_mineclonia() then
+	glass = "mcl_panes:pane_natural_flat"
+end
+if has_default then
+	glass = "xpanes:pane_flat"
+	iron_door = "doors:door_steel"
+	iron_trapdoor = "doors:trapdoor_steel"
+	comparator = "default:mese"
+	chest = "default:chest"
+end
 minetest.register_craft({
 	output = modname .. ":vending_machine_off",
 	recipe = {
-		{"mcl_doors:iron_trapdoor", "xpanes:pane_natural_flat", "mcl_doors:iron_trapdoor"},
-		{"mcl_doors:iron_door", "mcl_chests:chest", "mcl_doors:iron_door"},
-		{"mcl_doors:iron_trapdoor", "mcl_comparators:comparator_off_comp", "mcl_doors:iron_trapdoor"},
+		{iron_trapdoor, glass, iron_trapdoor},
+		{iron_door, chest, iron_door},
+		{iron_trapdoor, comparator, iron_trapdoor},
 	}
 })
-
